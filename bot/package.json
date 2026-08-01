@@ -1,0 +1,14 @@
+{
+  "name": "talmidhaham-bot",
+  "version": "0.1.0",
+  "description": "חברותא דיגיטלית - בוט ווצאפ אישי ללימוד תורה עם חזרה מרווחת",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "console": "node src/index.js --console"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
