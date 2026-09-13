@@ -4,7 +4,12 @@
 const BASE = 'https://www.sefaria.org/api/texts/';
 
 function stripHtml(s) {
-  return String(s).replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').trim();
+  return String(s)
+    .replace(/<[^>]*>/g, '')
+    .replace(/&(nbsp|thinsp|ensp|emsp);/g, ' ')
+    .replace(/&#\d+;/g, (m) => String.fromCharCode(parseInt(m.slice(2, -1), 10)))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+    .trim();
 }
 
 function flatten(x) {

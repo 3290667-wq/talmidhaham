@@ -1,4 +1,4 @@
-// לוחות תוכן: מסכתות הש"ס, המשנה, קיצור שולחן ערוך ותנ"ך
+// לוחות תוכן: מסכתות הש"ס, המשנה, שולחן ערוך ותנ"ך
 // המפתח האנגלי הוא שם ההפניה (ref) של ספריא.
 
 // תלמוד בבלי: שם עברי, ref בספריא, הדף האחרון (הדפים מתחילים מדף ב)
@@ -61,7 +61,26 @@ export const TANACH = [
   ['דברי הימים ב', 'II Chronicles', 36],
 ];
 
-export const KITZUR = { he: 'קיצור שולחן ערוך', ref: 'Kitzur Shulchan Arukh', simanim: 221 };
+// שולחן ערוך: ארבעת החלקים - שם עברי, ref בספריא, מספר סימנים, וכינויים מקובלים
+export const SHULCHAN_ARUKH = [
+  ['אורח חיים', 'Shulchan Arukh, Orach Chayim', 697, ['אוח', 'או"ח', 'אורח']],
+  ['יורה דעה', "Shulchan Arukh, Yoreh De'ah", 403, ['יוד', 'יו"ד', 'יורה']],
+  ['אבן העזר', 'Shulchan Arukh, Even HaEzer', 178, ['אהע', 'אה"ע', 'אבן עזר']],
+  ['חושן משפט', 'Shulchan Arukh, Choshen Mishpat', 427, ['חומ', 'חו"מ', 'חושן']],
+];
+export const SHULCHAN_ARUKH_HE = 'שולחן ערוך';
+
+// זיהוי חלק בשולחן ערוך: "אורח חיים", "שולחן ערוך אורח חיים", "או"ח", "יו"ד"...
+export function findShulchanArukhPart(name) {
+  const clean = (name || '').trim()
+    .replace(/["'׳״]/g, '')
+    .replace(/^(שולחן ערוך|שוע|שע)\s*[,-]?\s*/, '')
+    .replace(/^חלק\s+/, '')
+    .trim();
+  if (!clean) return null;
+  return SHULCHAN_ARUKH.find(([he, , , aliases]) =>
+    he === clean || aliases.map((a) => a.replace(/["'׳״]/g, '')).includes(clean)) || null;
+}
 
 // המרת מספר לאותיות עבריות (גימטריה) לתצוגת דף/פרק/סימן
 export function toHebrewNum(n) {
@@ -107,15 +126,23 @@ export function buildTrack(type, bookNameHe) {
     return { book: ref, bookHe: `משנה ${he}`, units };
   }
   if (type === 'halacha') {
+    // שולחן ערוך נלמד לפי חלק (אורח חיים / יורה דעה / אבן העזר / חושן משפט); סימן = יחידה
+    const row = findShulchanArukhPart(bookNameHe);
+    if (!row) return null;
+    const [he, ref, simanim] = row;
+    const bookHe = `${SHULCHAN_ARUKH_HE} ${he}`;
     const units = [];
-    for (let s = 1; s <= KITZUR.simanim; s++) {
-      units.push({ ref: `${KITZUR.ref} ${s}`, refHe: `${KITZUR.he} סימן ${toHebrewNum(s)}` });
+    for (let s = 1; s <= simanim; s++) {
+      units.push({ ref: `${ref} ${s}`, refHe: `${bookHe} סימן ${toHebrewNum(s)}` });
     }
-    return { book: KITZUR.ref, bookHe: KITZUR.he, units };
+    return { book: ref, bookHe, units };
   }
   if (type === 'tanach') {
-    let from = TANACH.findIndex(([he]) => he === (findByHebrew(TANACH, bookNameHe || 'בראשית') || TANACH[0])[0]);
-    if (from < 0) from = 0;
+    // שם שלא נמצא חייב להחזיר null (ולא ליפול בשקט לבראשית) - אחרת
+    // "שמואל" בשאלון או בהחלפת ספר הופך בלי אזהרה לתנ"ך מבראשית.
+    const row = bookNameHe ? findByHebrew(TANACH, bookNameHe) : TANACH[0];
+    if (!row) return null;
+    const from = TANACH.findIndex(([he]) => he === row[0]);
     const units = [];
     for (let i = from; i < TANACH.length; i++) {
       const [he, ref, chapters] = TANACH[i];
@@ -123,7 +150,7 @@ export function buildTrack(type, bookNameHe) {
         units.push({ ref: `${ref} ${c}`, refHe: `${he} פרק ${toHebrewNum(c)}` });
       }
     }
-    return { book: 'Tanach', bookHe: `תנ"ך (מ${(findByHebrew(TANACH, bookNameHe || 'בראשית') || TANACH[0])[0]})`, units };
+    return { book: 'Tanach', bookHe: `תנ"ך (מ${row[0]})`, units };
   }
   return null;
 }
@@ -131,6 +158,7 @@ export function buildTrack(type, bookNameHe) {
 export const TRACK_TYPES = {
   1: { type: 'gemara', label: 'גמרא (עמוד או דף ליום)' },
   2: { type: 'mishnah', label: 'משנה (פרקים ליום)' },
-  3: { type: 'halacha', label: 'הלכה - קיצור שולחן ערוך (סימנים ליום)' },
+  3: { type: 'halacha', label: 'הלכה - שולחן ערוך (סימנים ליום, לפי חלק)' },
   4: { type: 'tanach', label: 'תנ"ך (פרק ליום)' },
+  5: { type: 'free', label: 'ספר אחר - כל ספר מספריא (רמב"ם, מסילת ישרים, חובות הלבבות, תניא...)' },
 };
