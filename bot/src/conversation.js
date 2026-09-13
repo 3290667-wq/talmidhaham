@@ -1148,6 +1148,14 @@ function flagQuestion(store, unit, question, note = '') {
   return true;
 }
 
+// קושי חוזר נמדד על מפגשים נפרדים, לא על שאלה בודדת בתוך מפגש אחד
+function strugglingCount(unit) {
+  return (unit.reviewLog || []).filter((r) => r.score < 50).length;
+}
+function isStruggling(unit) {
+  return strugglingCount(unit) >= 2;
+}
+
 // ============ חזרות ============
 
 // זיהוי קטגוריה של יחידה לפי ה-ref האנגלי של ספריא - ל"חזרה תנך"/"חזרה משנה" וכו',
@@ -1284,6 +1292,11 @@ async function nextReviewUnit(store, send) {
   }
   rv.text = text;
   save();
+  // קושי חוזר: אין טעם לשאול שוב ושוב את אותו סוג שאלה בלי לשנות את הדרך.
+  // מציעים לחזור למקור לפני השאלות - הבנה קודמת לשליפה.
+  if (isStruggling(unit)) {
+    await send(`נראה ש${unit.refHe} עוד לא יושב (${strugglingCount(unit)} חזרות מתקשות).\nכדאי לקרוא שוב את המקור לפני השאלות: כתוב "טקסט ${unit.refHe}" - ואז נמשיך.`);
+  }
   const pos = rv.total > 1 ? ` · יחידה ${rv.total - rv.queue.length} מתוך ${rv.total}` : '';
   return send(`🔁 חזרה על ${unit.refHe} (נלמד ב-${unit.learnedAt})${pos}
 שאלה 1 מתוך ${unit.questions.length}:
