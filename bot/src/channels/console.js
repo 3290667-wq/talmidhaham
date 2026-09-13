@@ -13,6 +13,7 @@ export function startConsoleChannel(onMessage) {
     console.log('\n[הבוט]: ' + text);
     if (buttons?.length) console.log('       [ ' + buttons.map((b) => b.text).join(' ] [ ') + ' ]');
     console.log('');
+    return true; // אותו חוזה כמו הברידג': true = ההודעה נמסרה
   };
   console.log('=== מצב בדיקה מקומי - כתוב הודעה ולחץ Enter (Ctrl+C ליציאה) ===');
   console.log('טיפ: כתוב "הרשמה" כדי להתחיל את שאלון הפתיחה.\n');

@@ -21,6 +21,12 @@ export function afterReview(unit, score) {
   return unit;
 }
 
+// הצלחה בעזרת רמז או אחרי חשיפת התשובה אינה שליפה עצמאית, ולכן אינה מקדמת
+// את המרווח: התקרה 79 משאירה את היחידה באותו שלב (ולא מענישה מעבר לציון עצמו).
+export function effectiveReviewScore(avg, assisted) {
+  return assisted ? Math.min(avg, 79) : avg;
+}
+
 // יחידה נחשבת "בבעלות" אחרי 3 חזרות מוצלחות (מרווח 14 יום ומעלה)
 export function isOwned(unit) {
   return (unit.intervalIdx ?? 0) >= 3;

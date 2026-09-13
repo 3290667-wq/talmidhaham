@@ -1,12 +1,15 @@
 // מוח השיחה: שאלון פתיחה, משימה יומית, בחנים, חזרות ופקודות.
 // הבוט עובד בקבוצה: לכל משתתף רשומה משלו (תכנית, בחנים, חזרות, רצף),
 // והוא שותק על פטפוט קבוצתי שאינו מופנה אליו.
-import { loadUser, save, today } from './db.js';
+import { loadUser, save, today, addDays } from './db.js';
 import { buildTrack, TRACK_TYPES, toHebrewNum, BAVLI, MISHNAH, TANACH, SHULCHAN_ARUKH, findShulchanArukhPart } from './curriculum.js';
 import { resolveBook, buildBookTrack, resolveAnyRef } from './sefaria-books.js';
 import { getHebrewText } from './sefaria.js';
 import { generateQuiz, gradeAnswer, answerQuestion } from './ai.js';
-import { newUnitSchedule, afterReview, isOwned, dueUnits, INTERVALS } from './fsrs.js';
+import { newUnitSchedule, afterReview, isOwned, dueUnits, INTERVALS, effectiveReviewScore } from './fsrs.js';
+import { isRestDay, isRestDateStr, ilDateStr } from './calendar.js';
+import { logEvent, internalId } from './events.js';
+import { isUngraded } from './ai.js';
 
 const HELP = `📖 *חברותא דיגיטלית - כל מה שאני יודע לעשות*
 
@@ -20,9 +23,16 @@ const HELP = `📖 *חברותא דיגיטלית - כל מה שאני יודע 
 - "דלג" - יום עמוס? מסמן "יום חסד", מתקדם בלוח בלי בוחן והרצף נשמר
 
 *חזרות וזיכרון*
-- "חזרה" - מריץ את החזרות שהגיע זמנן (מספר השאלות - כמו בבוחן הלימוד)
+- "חזרה" - מנה קצרה של החזרות שהגיע זמנן (עד 2 יחידות / 10 שאלות), לא הכול בבת אחת
+- "המשך חזרות" - מנה נוספת · "סיימתי" - מספיק להיום
 - "חזרה תנך" / "חזרה זבחים" - חזרה רק על מסלול, ספר או קטגוריה מסוימת
-- "מצב" - כמה למדת, מה בבעלות מלאה, כמה חזרות ממתינות ומה הרצף
+- "מצב" - כמה למדת, מה בבעלות מלאה, מה נזכר בחזרה מאוחרת, והרצף
+
+*באמצע שאלה*
+- "רמז" - חצי מהתשובה (נרשם כתרגול, לא כשליפה עצמאית)
+- "לא יודע" - חושף את התשובה וממשיך
+- "דווח" - שאלה שגויה או לא ברורה? היא תושהה עד לבדיקה
+- "ביטול" - יציאה בלי ציון
 
 *הבנה בסוגיה*
 - "שאלה ..." - שאלה על מה שאתה לומד עכשיו (למשל: שאלה מה תירץ אביי?)
@@ -40,6 +50,7 @@ const HELP = `📖 *חברותא דיגיטלית - כל מה שאני יודע 
 - "הסר מסלול" - הסרת מסלול (הנלמד והחזרות נשמרים)
 - "שנה בראשית" / "שנה 2" - עריכת מסלול: החלפת הספר לספר אחר, קצב, שאלות או הסרה (הנלמד והחזרות נשמרים)
 - "שנה שעה 7" - שעת המשימה היומית
+- "שנה תזכורות 1" - כמה הודעות יזומות ביום (0 = בלי; ברירת מחדל: רק הודעת הבוקר)
 - "שנה שבת" - לימוד בשבת או מנוחה
 - "שנה תכנית" - בנייה מחדש מאפס (אזהיר אם אתה באמצע)
 
@@ -84,7 +95,7 @@ function stepQuestion(ob) {
 // בקבוצה הבוט לא מגיב לכל הודעה. הוא עונה רק כשפונים אליו:
 // מילת פתיחה, פקודה מוכרת, או כשהמשתמש באמצע שאלון/בוחן/חזרה.
 const START_WORDS = ['הרשמה', 'התחל', 'תלמיד חכם', 'חברותא'];
-const COMMANDS = ['עזרה', '?', 'שנה תכנית', 'שנה תכנית בכל זאת', 'היום', 'מצב', 'למדתי', 'חזרה', 'דלג', 'הגדרות', 'שיעור', 'שיעורים', 'טקסט'];
+const COMMANDS = ['עזרה', '?', 'שנה תכנית', 'שנה תכנית בכל זאת', 'היום', 'מצב', 'למדתי', 'חזרה', 'דלג', 'הגדרות', 'שיעור', 'שיעורים', 'טקסט', 'המשך חזרות', 'המשך', 'סיימתי', 'רמז', 'לא יודע', 'דווח'];
 
 // כפתורי פעולה מהירה. ה-id הוא בדיוק הפקודה, כך שלחיצה זהה להקלדה.
 // ווצאפ מציג עד 3 כפתורים בהודעה.
@@ -96,6 +107,8 @@ const BTN = {
   status: { id: 'מצב', text: '📊 מצב' },
   skip: { id: 'דלג', text: '🕊️ יום חסד' },
   shiur: { id: 'שיעור', text: '🎧 שיעור' },
+  more: { id: 'המשך חזרות', text: '🔁 עוד מנה' },
+  hint: { id: 'רמז', text: '💡 רמז' },
 };
 
 // send מקבל מחרוזת, או אובייקט עם כפתורים. הערוץ מחליט איך לשלוח.
@@ -112,6 +125,7 @@ function isForBot(store, msg) {
   if (msg.startsWith('טקסט')) return true;
   if (msg.startsWith('שנה קצב') || msg.startsWith('הוסף מסלול') || msg.startsWith('הסר מסלול')) return true;
   if (msg.startsWith('שנה שאלות') || msg.startsWith('שנה רש') || msg.startsWith('שנה תוספות')) return true;
+  if (msg.startsWith('שנה תזכורות')) return true;
   if (msg === 'ערוך' || msg === 'ערוך תכנית') return true;
   // "שנה <מסלול>" - עריכת מסלול. עובר רק אם הטקסט באמת מתאים למסלול בתכנית,
   // כדי שפטפוט קבוצתי ("שנה טובה") לא יעיר את הבוט.
@@ -127,17 +141,25 @@ export function buildDaily(store) {
   const user = store.user;
   const assignments = [];
   if (user?.onboarded) {
-    const isShabbat = new Date().getDay() === 6;
-    if (!(user.skipShabbat && isShabbat)) {
+    // יום מנוחה = שבת או יום טוב (עד השדרוג הוכרה רק שבת)
+    const rest = isRestDay();
+    if (!(user.skipShabbat && rest)) {
       for (const tr of user.tracks) {
         const refs = tr.units.slice(tr.index, tr.index + tr.pace);
         if (refs.length) assignments.push({ track: tr.bookHe, type: tr.type, refs });
       }
     }
   }
-  store.daily = { date: t, sentMorning: false, lastPingAt: 0, assignments, completedTracks: [] };
+  // pings = כמה הודעות יזומות נשלחו היום (הודעת הבוקר נספרת), morningAttempts =
+  // כמה ניסיונות שליחה נעשו. שניהם נדרשים כדי לא להציף ולא "לאבד" הודעה שנכשלה.
+  store.daily = { date: t, sentMorning: false, morningAttempts: 0, pings: 0, lastPingAt: 0, assignments, completedTracks: [] };
   save();
   return store.daily;
+}
+
+// כמה חזרות ממתינות - למתזמן ולהודעות, בלי לחשוף את המבנה הפנימי
+export function dueCount(store) {
+  return dueUnits(store.units).length;
 }
 
 // איחול לפי שעון ישראל - השרת עצמו רץ על שעון אירופה (שעה אחורה)
@@ -184,19 +206,35 @@ export function refsLabel(refs) {
 export function morningMessage(store) {
   const daily = buildDaily(store);
   const due = dueUnits(store.units).length;
+  const restToday = isRestDay() && store.user?.skipShabbat;
+  const finished = (store.user?.tracks || []).every((t) => t.index >= t.units.length);
   if (!daily.assignments.length) {
+    // עד השדרוג כל יום בלי משימה קיבל "שבת שלום", גם באמצע השבוע
+    const head = restToday ? 'שבת שלום!' : greeting();
+    const body = restToday ? 'היום מנוחה בלוח.'
+      : finished ? 'סיימת את כל מה שבתכנית - מזל טוב! ("הוסף מסלול" לספר הבא)'
+        : 'היום אין לימוד חדש בלוח.';
     return due
-      ? `שבת שלום! היום אין לימוד חדש בלוח, אבל ממתינות ${due} חזרות. כתוב "חזרה" כשנוח לך.`
-      : 'שבת שלום! היום מנוחה בלוח. נתראה מחר בעז"ה.';
+      ? `${head} ${body} ממתינות ${due} חזרות - ${doseLabel(store)}. כתוב "חזרה" כשנוח לך.`
+      : `${head} ${body} נתראה מחר בעז"ה.`;
   }
   let msg = `${greeting()} המשימה להיום לפי התכנית שלך:\n`;
   for (const a of daily.assignments) {
     msg += `\n- ${refsLabel(a.refs)}`;
   }
-  if (due) msg += `\n\nממתינות גם ${due} חזרות (כתוב "חזרה").`;
-  if (store.stats.streak > 1) msg += `\nרצף נוכחי: ${store.stats.streak} ימים - חזק!`;
+  if (due) msg += `\n\n🔁 ממתינות ${due} חזרות. "חזרה" ${doseLabel(store)} - לא הכול בבת אחת.`;
+  const st = streakInfo(store);
+  if (st.current > 1) msg += `\nרצף נוכחי: ${st.current} ימי לימוד - חזק!`;
   msg += '\n\nכשתסיים ללמוד מהספר - כתוב לי "למדתי" ואבחן אותך.';
   return msg;
+}
+
+// כמה באמת ייפתח ב"חזרה" - כדי שהמספר הגדול לא ירתיע
+function doseLabel(store) {
+  const due = dueUnits(store.units);
+  if (!due.length) return '';
+  const { chosen, questions } = pickDose(due, store);
+  return `פותח מנה של ${chosen.length === 1 ? 'יחידה אחת' : `${chosen.length} יחידות`} · ${questions} שאלות`;
 }
 
 // תזכורת חוזרת (3 שעות אחרי הפעילות האחרונה), מותאמת להתקדמות של היום:
@@ -205,10 +243,21 @@ export function reminderPayload(store) {
   const daily = store.daily;
   const done = daily.assignments.filter((a) => daily.completedTracks.includes(a.track));
   const open = daily.assignments.filter((a) => !daily.completedTracks.includes(a.track));
-  const text = done.length
+  const due = dueUnits(store.units).length;
+  // אין משימת לימוד פתוחה אבל יש חזרות: עד השדרוג לא נשלחה כאן שום תזכורת,
+  // ולכן 30 יחידות נשארו בפיגור בלי שאיש הזכיר אותן אפילו פעם אחת.
+  if (!open.length) {
+    if (!due) return withButtons('סיימת את הלימוד של היום. כל הכבוד! 👏', [BTN.status, BTN.help]);
+    return withButtons(
+      `סיימת את הלימוד של היום 👏\n🔁 ממתינות ${due} חזרות - ${doseLabel(store)}. כתוב "חזרה".`,
+      [BTN.review, BTN.status, BTN.help],
+    );
+  }
+  let text = done.length
     ? `כל הכבוד - השלמת היום את ${done.map((a) => a.track).join(', ')}! 👏\nנשאר עוד: ${open.map((a) => refsLabel(a.refs)).join(' · ')}\nכשתלמד - כתוב "למדתי", ואם היום עמוס - "דלג" ישלים את השאר בלי בוחן.`
     : `תזכורת ידידותית: עוד לא סימנת "למדתי" היום (${open.map((a) => a.track).join(', ')}). גם 10 דקות שוות עולם - ואם היום קשה, כתוב "דלג" לשמירת הרצף.`;
-  return withButtons(text, [BTN.learned, BTN.skip, BTN.help]);
+  if (due) text += `\n🔁 וממתינות ${due} חזרות - ${doseLabel(store)}.`;
+  return withButtons(text, due ? [BTN.learned, BTN.review, BTN.help] : [BTN.learned, BTN.skip, BTN.help]);
 }
 
 // הודעת הבוקר עם כפתורי הפעולות שרלוונטיות עכשיו
@@ -427,6 +476,17 @@ export async function handleMessage(userId, userName, text, send) {
     if (msg === 'מצב') return send(statusMessage(store));
     if (msg === 'למדתי' || msg.startsWith('למדתי')) return await startQuiz(store, send, msg.replace(/^למדתי\s*/, ''));
     if (msg === 'חזרה' || msg.startsWith('חזרה ')) return await startReview(store, send, msg.replace(/^חזרה\s*/, ''));
+    if (msg === 'המשך חזרות' || msg === 'המשך') return await startReview(store, send, store.lastReviewFilter || '');
+    if (msg === 'סיימתי') {
+      const due = dueUnits(store.units).length;
+      return send(withButtons(
+        `כל הכבוד על מה שלמדת היום! 👏${due ? `\nנשארו ${due} חזרות - הן ימתינו לך.` : ''}`,
+        [BTN.status, BTN.help],
+      ));
+    }
+    if (msg === 'רמז' || msg === 'לא יודע') return send('"רמז" ו"לא יודע" עובדים בתוך שאלה. "למדתי" לבוחן היומי, "חזרה" לחזרות.');
+    if (msg === 'דווח' || msg.startsWith('דווח ')) return send('"דווח" מסמן שאלה בעייתית בזמן שהיא נשאלת. כתוב אותו כשאתה באמצע בוחן או חזרה.');
+    if (msg.startsWith('שנה תזכורות')) return setReminders(store, msg, send);
     if (msg === 'דלג') {
       const daily = buildDaily(store);
       daily.completedTracks = daily.assignments.map((a) => a.track);
@@ -856,7 +916,9 @@ async function startQuiz(store, send, trackQuery = '') {
   }
   const a = pending[0];
   const tr = store.user.tracks.find((t) => t.bookHe === a.track);
-  await send(`יפה מאוד! מכין בוחן קצר על ${refsLabel(a.refs)}...`);
+  // הצגת העומס לפני ההתחלה - כמה שאלות מחכות, כדי שאפשר יהיה להחליט
+  const planned = (tr?.questions || 3) + (commentaryCount(tr?.rashi) || 0) + (commentaryCount(tr?.tosafot) || 0);
+  await send(`יפה מאוד! מכין בוחן על ${refsLabel(a.refs)} - כ-${planned} שאלות.\n(באמצע: "רמז" · "לא יודע" · "דווח" · "ביטול")`);
   const { text: fetchedText, extras } = await fetchMaterial(a.refs, tr);
   let text = fetchedText;
   if (!text.trim()) return send('לא הצלחתי לשלוף את הטקסט מספריא כרגע. נסה שוב מאוחר יותר.');
@@ -878,17 +940,51 @@ async function handleQuizAnswer(store, msg, send) {
   const q = store.state.quiz;
   const question = q.questions[q.qIdx];
   const refHe = refsLabel(q.refs);
-  const { score, feedback } = await gradeAnswer(refHe, q.text, question.q, question.ideal, msg);
+
+  if (msg === 'רמז') {
+    q.assisted = true;
+    save();
+    logEvent('assist', { user: internalId(store.id), kind: 'hint', where: 'quiz' });
+    return send(`💡 ${hintFor(question)}\nעכשיו נסה להשלים במילים שלך.`);
+  }
+  if (msg === 'לא יודע') {
+    q.assisted = true;
+    q.scores.push(0);
+    logEvent('assist', { user: internalId(store.id), kind: 'reveal', where: 'quiz' });
+    await send(`התשובה: ${question.ideal}\n(נרשם כתרגול - ניפגש עם זה שוב בחזרה.)`);
+    q.qIdx++;
+    if (q.qIdx < q.questions.length) {
+      save();
+      return send(`שאלה ${q.qIdx + 1} מתוך ${q.questions.length}:\n${q.questions[q.qIdx].q}`);
+    }
+    return finishQuiz(store, send);
+  }
+  if (msg === 'דווח' || msg.startsWith('דווח ')) {
+    flagQuestion(store, { refHe }, question, msg.replace(/^דווח\s*/, ''));
+    save();
+    return send('תודה - השאלה סומנה לבדיקה ולא תישאל שוב עד שתיבדק. כתוב "לא יודע" כדי לעבור הלאה.');
+  }
+
+  const graded = await gradeSafely(store, [refHe, q.text, question.q, question.ideal, msg], send, 'quiz');
+  if (!graded) return; // לא דורג - נשארים על אותה שאלה
+  const { score, feedback } = graded;
   q.scores.push(score);
-  await send(`${score >= 80 ? 'מצוין!' : score >= 50 ? 'לא רע.' : 'שווה לחזור על זה.'} (ציון: ${score})\n${feedback}`);
+  let reply = `${score >= 80 ? 'מצוין!' : score >= 50 ? 'לא רע.' : 'שווה לחזור על זה.'} (ציון: ${score})\n${feedback}`;
+  if (score < 80) reply += `\n📖 המקור: ${refHe}`;
+  await send(reply);
   q.qIdx++;
   if (q.qIdx < q.questions.length) {
     save();
     return send(`שאלה ${q.qIdx + 1} מתוך ${q.questions.length}:\n${q.questions[q.qIdx].q}`);
   }
-  // סיום הבוחן על המסלול
-  const avg = Math.round(q.scores.reduce((a, b) => a + b, 0) / q.scores.length);
-  const daily = store.daily;
+  return finishQuiz(store, send);
+}
+
+// סיום הבוחן על המסלול: רישום היחידות, תזמון חזרה ראשונה וסימון יום לימוד
+async function finishQuiz(store, send) {
+  const q = store.state.quiz;
+  const avg = q.scores.length ? Math.round(q.scores.reduce((a, b) => a + b, 0) / q.scores.length) : 0;
+  const daily = buildDaily(store);
   daily.completedTracks.push(q.track);
   // רישום היחידות ותזמון חזרה ראשונה.
   // כל יחידה מקבלת רק את השאלות שנוצרו עליה (לפי שדה unit מה-AI) - אחרת
@@ -913,6 +1009,9 @@ async function handleQuizAnswer(store, msg, send) {
       asked: prev?.asked || [],
       qRound: prev?.qRound || 0,
       scores: [avg],
+      firstAssisted: !!q.assisted,
+      lastExposure: today(),
+      reviewLog: prev?.reviewLog || [],
       ...newUnitSchedule(),
     };
     if (questions.length) rememberAsked(store.units[r.ref], questions);
@@ -922,6 +1021,11 @@ async function handleQuizAnswer(store, msg, send) {
   const tr = store.user.tracks.find((t) => t.bookHe === q.track);
   if (tr) tr.index += q.refs.length;
   store.state = { mode: 'idle' };
+  markStudyDay(store);
+  logEvent('learn', {
+    user: internalId(store.id), units: q.refs.length, questions: q.scores.length,
+    score: avg, assisted: !!q.assisted,
+  });
 
   let msg2 = `סיימנו את הבוחן על ${q.track} - ציון ממוצע ${avg}. `;
   msg2 += avg >= 80 ? 'היחידה בדרך לבעלות מלאה!' : 'ניפגש עם החומר הזה שוב בחזרות.';
@@ -932,7 +1036,7 @@ async function handleQuizAnswer(store, msg, send) {
     msg2 += `\n\nנשאר עוד היום: ${remaining.map((a) => a.track).join(', ')}. כשתלמד - כתוב "למדתי" (או "למדתי ${remaining[0].track}" לבחירת מסלול).`;
   } else {
     touchStreak(store);
-    msg2 += `\n\nזהו! יום הלימוד הושלם. רצף: ${store.stats.streak} ימים.`;
+    msg2 += `\n\nזהו! יום הלימוד הושלם. רצף ימי לימוד: ${streakInfo(store).current}.`;
   }
   save();
   const doneButtons = remaining.length ? [BTN.learned, BTN.help] : [BTN.status, BTN.help];
@@ -990,6 +1094,58 @@ function rememberAsked(unit, questions) {
   const hist = Array.isArray(unit.asked) ? unit.asked : [];
   unit.asked = [...new Set([...hist, ...questions.map((q) => q.q)])].slice(-ASKED_MEMORY);
   unit.qRound = (unit.qRound || 0) + 1;
+}
+
+
+// ============ עזרה בתוך שאלה, דירוג בטוח ותיעוד חזרה ============
+
+// רמז = החלק הראשון של התשובה הנכונה. שימוש ברמז מסומן, והיחידה לא תיחשב
+// "נזכרה עצמאית" בסבב הזה - תרגול הוא לא שליפה מהזיכרון.
+function hintFor(question) {
+  const words = String(question?.ideal || '').split(/\s+/).filter(Boolean);
+  if (!words.length) return 'אין לי רמז לשאלה הזו - נסה לענות מה שאתה זוכר.';
+  return words.slice(0, Math.max(2, Math.ceil(words.length * 0.4))).join(' ') + '...';
+}
+
+function daysBetween(from, to) {
+  if (!from || !to) return null;
+  return Math.round((new Date(`${to}T12:00:00`) - new Date(`${from}T12:00:00`)) / 86400000);
+}
+
+// מתי הלומד נחשף לאחרונה לתשובה/למקור של היחידה - הבסיס ל"זכירה לאחר פער"
+function lastExposure(unit) {
+  return unit.lastExposure || unit.learnedAt || null;
+}
+
+const REVIEW_LOG_MAX = 20;
+function pushReviewLog(unit, entry) {
+  unit.reviewLog = [...(unit.reviewLog || []), entry].slice(-REVIEW_LOG_MAX);
+}
+
+// דירוג עם הפרדה בין "נכשל זמנית" לבין "לא דורג".
+// ungraded: אין ציון, אין קידום, המצב לא מתקדם - הלומד מוזמן לנסות שוב.
+async function gradeSafely(store, args, send, ctx) {
+  try {
+    return await gradeAnswer(...args);
+  } catch (e) {
+    if (isUngraded(e)) {
+      logEvent('ungraded', { user: internalId(store.id), where: ctx, reason: e.message.slice(0, 60) });
+      await send('לא הצלחתי לדרג את התשובה הזו, ולכן לא נתתי ציון. כתוב אותה שוב (או "רמז" / "לא יודע").');
+      return null;
+    }
+    throw e;
+  }
+}
+
+// שאלה שדווחה כבעייתית מושהית: לא תוצג שוב עד שתיבדק ידנית
+function flagQuestion(store, unit, question, note = '') {
+  if (!unit || !question) return false;
+  question.flagged = { at: today(), note: note.slice(0, 120) };
+  store.flags = [...(store.flags || []), {
+    at: today(), ref: unit.ref || null, refHe: unit.refHe, q: question.q, note: note.slice(0, 120), status: 'open',
+  }].slice(-100);
+  logEvent('flag', { user: internalId(store.id), refHe: unit.refHe });
+  return true;
 }
 
 // ============ חזרות ============
@@ -1062,19 +1218,47 @@ async function prepareReviewQuestions(store, ref, send) {
   } catch (e) {
     console.error('prepareReviewQuestions', ref, e.message);
   }
+  // שאלה שדווחה כבעייתית מושהית עד לבדיקה ידנית - לא נשאלת שוב
+  if (Array.isArray(unit.questions)) unit.questions = unit.questions.filter((q) => !q.flagged);
   return { unit, text };
+}
+
+// מנת חזרה: עד שתי יחידות ועד עשר שאלות, לפי המגבלה שמגיעה קודם, והישן ביותר
+// קודם. יחידה אף פעם לא נחתכת באמצע - אם כבר פתחנו אותה, עוברים עליה כולה.
+// בלי זה, "חזרה" עם 30 יחידות בפיגור פתחה תור של 150 שאלות ברצף.
+const REVIEW_MAX_UNITS = 2;
+const REVIEW_MAX_QUESTIONS = 10;
+
+export function pickDose(due, store) {
+  const sorted = [...due].sort((a, b) => String(a.nextReview || '').localeCompare(String(b.nextReview || '')));
+  const chosen = [];
+  let questions = 0;
+  for (const d of sorted) {
+    const n = unitQuestionCount(store, store.units[d.ref] || d);
+    if (chosen.length && (chosen.length >= REVIEW_MAX_UNITS || questions + n > REVIEW_MAX_QUESTIONS)) break;
+    chosen.push(d);
+    questions += n;
+  }
+  return { chosen, questions };
 }
 
 async function startReview(store, send, query = '') {
   const due = dueUnits(store.units);
-  if (!due.length) return send('אין חזרות ממתינות כרגע - הזיכרון שלך מעודכן!');
-  const chosen = filterDue(due, store, query.trim());
-  if (!chosen.length) {
+  if (!due.length) return send(withButtons('אין חזרות ממתינות כרגע - הזיכרון שלך מעודכן!', [BTN.learned, BTN.status]));
+  const matching = filterDue(due, store, query.trim());
+  if (!matching.length) {
     const byName = due.map((d) => d.refHe).join(', ');
     return send(`אין חזרות ממתינות על "${query.trim()}".\nממתינות כרגע: ${byName}.\nכתוב "חזרה" לכולן, או "חזרה <שם>" לחלק מהן.`);
   }
-  const queue = chosen.map((d) => d.ref);
-  store.state = { mode: 'review', review: { queue, total: queue.length, ref: null, qIdx: 0, scores: [], text: '' } };
+  const { chosen, questions } = pickDose(matching, store);
+  const left = matching.length - chosen.length;
+  store.lastReviewFilter = query.trim();
+  store.state = {
+    mode: 'review',
+    review: { queue: chosen.map((d) => d.ref), total: chosen.length, ref: null, qIdx: 0, scores: [], text: '', assisted: false, left },
+  };
+  save();
+  await send(`🔁 מנה קצרה: ${chosen.length === 1 ? 'יחידה אחת' : `${chosen.length} יחידות`} · ${questions} שאלות${left ? ` · ממתינות עוד ${left} להמשך` : ''}\n(באמצע שאלה: "רמז" · "לא יודע" · "דווח" על שאלה בעייתית · "ביטול" ליציאה)`);
   return nextReviewUnit(store, send);
 }
 
@@ -1086,13 +1270,17 @@ async function nextReviewUnit(store, send) {
   rv.scores = [];
   const { unit, text } = await prepareReviewQuestions(store, rv.ref, send);
   if (!unit.questions?.length) {
-    // אין שאלות וגם לא הצלחנו לייצר - לא מענישים, מדלגים
-    afterReview(unit, 100);
+    // לא הצלחנו לייצר שאלות - זו אינה חזרה מוצלחת. עד כאן היחידה קיבלה 100
+    // וקודמה בסולם כאילו נזכרה מושלם, בלי שנבדקה כלל. מעכשיו: "לא דורג",
+    // בלי ציון, בלי קידום מרווח, והיחידה נשארת בתור.
+    unit.ungraded = { at: today(), reason: 'no_questions' };
+    logEvent('ungraded', { user: internalId(store.id), reason: 'no_questions' });
     save();
+    await send(`לא הצלחתי להכין שאלות על ${unit.refHe} כרגע. היחידה לא דורגה ונשארת בתור החזרות.`);
     if (rv.queue.length) return nextReviewUnit(store, send);
     store.state = { mode: 'idle' };
     save();
-    return send('כל החזרות הושלמו להיום!');
+    return send(withButtons('סיימנו את המנה.', [BTN.review, BTN.status, BTN.help]));
   }
   rv.text = text;
   save();
@@ -1107,19 +1295,71 @@ async function handleReviewAnswer(store, msg, send) {
   const unit = store.units[rv.ref];
   const question = unit.questions[rv.qIdx];
   const text = rv.text || question.ideal;
-  const { score, feedback } = await gradeAnswer(unit.refHe, text, question.q, question.ideal, msg);
+
+  // עזרה בתוך השאלה: רמז וחשיפה מסומנים כתרגול, לא כשליפה עצמאית
+  if (msg === 'רמז') {
+    rv.assisted = true;
+    save();
+    logEvent('assist', { user: internalId(store.id), kind: 'hint', where: 'review' });
+    return send(`💡 ${hintFor(question)}\nעכשיו נסה להשלים במילים שלך.`);
+  }
+  if (msg === 'לא יודע') {
+    rv.assisted = true;
+    rv.scores.push(0);
+    logEvent('assist', { user: internalId(store.id), kind: 'reveal', where: 'review' });
+    await send(`התשובה: ${question.ideal}\n(נרשם כתרגול, לא כשליפה עצמאית - ניפגש איתה שוב.)`);
+    rv.qIdx++;
+    if (rv.qIdx < unit.questions.length) {
+      save();
+      return send(`שאלה ${rv.qIdx + 1} מתוך ${unit.questions.length}:\n${unit.questions[rv.qIdx].q}`);
+    }
+    return finishReviewUnit(store, send);
+  }
+  if (msg === 'דווח' || msg.startsWith('דווח ')) {
+    flagQuestion(store, { ...unit, ref: rv.ref }, question, msg.replace(/^דווח\s*/, ''));
+    rv.assisted = true;
+    save();
+    return send('תודה - השאלה סומנה לבדיקה ולא תישאל שוב עד שתיבדק. כתוב "לא יודע" כדי לעבור הלאה.');
+  }
+
+  const graded = await gradeSafely(store, [unit.refHe, text, question.q, question.ideal, msg], send, 'review');
+  if (!graded) return; // לא דורג - נשארים על אותה שאלה
+  const { score, feedback } = graded;
   rv.scores.push(score);
-  await send(`${score >= 80 ? 'זכור היטב!' : score >= 50 ? 'כמעט.' : 'נשכח קצת - זה בסדר, בשביל זה חוזרים.'} (ציון: ${score})\n${feedback}`);
+  let reply = `${score >= 80 ? 'זכור היטב!' : score >= 50 ? 'כמעט.' : 'נשכח קצת - זה בסדר, בשביל זה חוזרים.'} (ציון: ${score})\n${feedback}`;
+  if (score < 80) reply += `\n📖 המקור: ${unit.refHe}`;
+  await send(reply);
   rv.qIdx++;
   if (rv.qIdx < unit.questions.length) {
     save();
     return send(`שאלה ${rv.qIdx + 1} מתוך ${unit.questions.length}:\n${unit.questions[rv.qIdx].q}`);
   }
-  // סיום היחידה: הציון לחזרה המרווחת הוא ממוצע כל שאלותיה
-  const avg = Math.round(rv.scores.reduce((a, b) => a + b, 0) / rv.scores.length);
-  afterReview(unit, avg);
+  return finishReviewUnit(store, send);
+}
+
+// סיום יחידה בחזרה: ציון, תזמון הבא, תיעוד ראיה, והמשך המנה.
+async function finishReviewUnit(store, send) {
+  const rv = store.state.review;
+  const unit = store.units[rv.ref];
+  const avg = rv.scores.length ? Math.round(rv.scores.reduce((a, b) => a + b, 0) / rv.scores.length) : 0;
+  const assisted = !!rv.assisted;
+  // הצלחה בעזרת רמז/חשיפה אינה ידיעה מבוססת: היא לא מקדמת את המרווח.
+  // היא גם לא מענישה מעבר לציון עצמו - ממשיכים לתרגל.
+  const effective = effectiveReviewScore(avg, assisted);
+  const gap = daysBetween(lastExposure(unit), today());
+  afterReview(unit, effective);
   unit.scores = [...(unit.scores || []), avg];
-  let out = `סיימנו את החזרה על ${unit.refHe} - ציון ${avg}.\nחזרה הבאה בעוד ${INTERVALS[unit.intervalIdx]} ימים.`;
+  pushReviewLog(unit, { at: today(), score: avg, assisted, gapDays: gap });
+  unit.lastExposure = today();
+  delete unit.ungraded;
+  markStudyDay(store); // יום שבו רק חזרת הוא יום לימוד לכל דבר
+  logEvent('review', {
+    user: internalId(store.id), score: avg, assisted, gapDays: gap,
+    intervalIdx: unit.intervalIdx, questions: rv.scores.length,
+  });
+
+  let out = `סיימנו את החזרה על ${unit.refHe} - ציון ${avg}${assisted ? ' (עם עזרה - נרשם כתרגול)' : ''}.\nחזרה הבאה בעוד ${INTERVALS[unit.intervalIdx]} ימים.`;
+  rv.assisted = false;
   if (rv.queue.length) {
     save();
     await send(out);
@@ -1127,12 +1367,12 @@ async function handleReviewAnswer(store, msg, send) {
   }
   store.state = { mode: 'idle' };
   save();
-  const stillDue = dueUnits(store.units);
-  if (stillDue.length) {
-    out += `\n\nממתינות עוד ${stillDue.length} חזרות (${stillDue.map((d) => d.refHe).join(', ')}) - כתוב "חזרה" להמשיך.`;
-    return send(withButtons(out, [BTN.review, BTN.status, BTN.help]));
+  const stillDue = dueUnits(store.units).length;
+  if (stillDue) {
+    out += `\n\nסיימת את המנה 👏 ממתינות עוד ${stillDue} חזרות. "המשך חזרות" למנה נוספת, או "סיימתי" להיום.`;
+    return send(withButtons(out, [BTN.more, BTN.status, BTN.help]));
   }
-  out += '\n\nכל החזרות הושלמו להיום!';
+  out += '\n\nכל החזרות הושלמו - הזיכרון שלך מעודכן!';
   return send(withButtons(out, [BTN.status, BTN.help]));
 }
 
@@ -1477,7 +1717,7 @@ function planChange(store, confirmed, send) {
       const left = t.units.length - t.index;
       msg += `\n- ${t.bookHe}: הגעת ל${t.units[t.index]?.refHe || 'סוף'} (נשארו ${left} יחידות)`;
     }
-    msg += `\n\nלא כדאי להחליף באמצע - מסכת שנקטעת באמצע נוטה להישאר לא גמורה, והרצף (${store.stats.streak} ימים) נשבר.`;
+    msg += `\n\nלא כדאי להחליף באמצע - מסכת שנקטעת באמצע נוטה להישאר לא גמורה, והרצף (${streakInfo(store).current} ימי לימוד) נשבר.`;
     msg += `\n\n${learned} היחידות שכבר למדת והחזרות עליהן יישמרו${due ? ` (${due} ממתינות עכשיו)` : ''} - רק הלוח יתחלף, ותתחיל את הספר החדש מההתחלה.`;
     msg += '\n\nרוצה רק לשנות כמות יומית או להוסיף/להסיר מסלול? יש דרך בלי לאבד כלום: "שנה קצב" · "הוסף מסלול" · "הסר מסלול".';
     msg += '\n\nלבנייה מחדש מאפס בכל זאת - כתוב "שנה תכנית בכל זאת".\nלהמשיך כרגיל - כתוב "היום".';
@@ -1497,9 +1737,11 @@ function settingsMessage(store) {
   let msg = 'ההגדרות שלך:\n';
   for (const tr of u.tracks) msg += `\n- ${tr.bookHe}: ${paceLabel(tr)} · ${quizLabel(tr)}`;
   msg += `\n\n- שעת המשימה היומית: ${u.sendHour}:00`;
-  msg += `\n- שבת: ${u.skipShabbat ? 'מנוחה בלוח' : 'לימוד רגיל'}`;
+  msg += `\n- שבת ויום טוב: ${u.skipShabbat ? 'מנוחה בלוח' : 'לימוד רגיל'}`;
+  const rpd = Number.isFinite(u.remindPerDay) ? u.remindPerDay : 1;
+  msg += `\n- הודעות יזומות ביום: ${rpd === 0 ? 'כבוי' : rpd} ("שנה תזכורות 0-6")`;
   msg += '\n\nלעריכת מסלול (החלפת ספר, קצב, שאלות, הסרה): "שנה <שם מסלול>", למשל "שנה בראשית"';
-  msg += '\nעוד: "שנה קצב" · "שנה שאלות" · "שנה רש\"י" · "שנה תוספות" · "הוסף מסלול" · "הסר מסלול" · "שנה שעה 7" · "שנה שבת" · "שנה תכנית" (מאפס)';
+  msg += '\nעוד: "שנה קצב" · "שנה שאלות" · "שנה רש\"י" · "שנה תוספות" · "הוסף מסלול" · "הסר מסלול" · "שנה שעה 7" · "שנה שבת" · "שנה תזכורות" · "שנה תכנית" (מאפס)';
   return msg;
 }
 
@@ -1510,6 +1752,22 @@ function setSendHour(store, msg, send) {
   if (store.daily) store.daily.sentMorning = false; // שינוי באמצע היום ייכנס לתוקף מיד
   save();
   return send(`מעכשיו אשלח לך את המשימה היומית ב-${h}:00.`);
+}
+
+// כמה הודעות יזומות ביום. ברירת המחדל היא אחת - הודעת הבוקר עצמה.
+// עד השדרוג נשלחה תזכורת כל 3 שעות, כלומר כ-5 ביום למי שלא למד.
+function setReminders(store, msg, send) {
+  const m = msg.match(/\d+/);
+  if (!m) {
+    const cur = Number.isFinite(store.user?.remindPerDay) ? store.user.remindPerDay : 1;
+    return send(`כרגע: ${cur === 0 ? 'בלי הודעות יזומות' : `${cur} הודעות יזומות ביום`}.\nלשינוי: "שנה תזכורות 1" (ברירת מחדל - רק הודעת הבוקר), "שנה תזכורות 0" לכיבוי, או עד 6.`);
+  }
+  const n = Math.max(0, Math.min(6, parseInt(m[0], 10)));
+  store.user.remindPerDay = n;
+  save();
+  if (n === 0) return send('סומן: לא אשלח יותר הודעות יזומות. אני כאן בכל רגע שתכתוב "היום" או "חזרה".');
+  if (n === 1) return send('סומן: הודעה יזומה אחת ביום - הודעת הבוקר, והיא כוללת גם את החזרות הממתינות.');
+  return send(`סומן: עד ${n} הודעות ביום (הודעת הבוקר ועוד ${n - 1} תזכורות, לפחות 3 שעות מהפעילות האחרונה שלך).`);
 }
 
 function toggleShabbat(store, send) {
@@ -1531,18 +1789,99 @@ function statusMessage(store) {
     msg += `\n- ${tr.bookHe}: ${tr.index}/${tr.units.length} יחידות (${pct}%)`;
     if (tr.index >= tr.units.length) msg += ' - סיום! מזל טוב!';
   }
+  const st = streakInfo(store);
+  const recalled = Object.values(store.units).filter(isRecalled).length;
   msg += `\n\nיחידות שנלמדו: ${total} | בבעלות מלאה (3+ חזרות): ${owned}`;
-  msg += `\nחזרות ממתינות: ${due}`;
-  msg += `\nרצף ימים: ${store.stats.streak}`;
+  msg += `\nנזכרו בחזרה מאוחרת (בלי עזרה, 7+ ימים): ${recalled}`;
+  msg += `\nחזרות ממתינות: ${due}${due ? ` - "חזרה" ${doseLabel(store)}` : ''}`;
+  msg += `\nרצף ימי לימוד: ${st.current} (שיא: ${st.longest} · סה"כ ${st.total} ימי לימוד)`;
+  if (store.stats.fullDays) msg += `\nימים שבהם השלמת את כל התכנית: ${store.stats.fullDays}`;
   return msg;
 }
 
+// "נזכר בחזרה מאוחרת": שתי הצלחות עצמאיות (בלי רמז/חשיפה), ולפחות אחת מהן
+// אחרי פער של שבוע ומעלה מהחשיפה הקודמת. זו ראיה שנאספה, לא הבטחה לזכירה.
+export function isRecalled(unit) {
+  const log = (unit.reviewLog || []).filter((r) => !r.assisted && r.score >= 80);
+  return log.length >= 2 && log.some((r) => (r.gapDays ?? 0) >= 7);
+}
+
+// ============ רצף ימי לימוד ============
+// עד השדרוג הרצף התקדם רק ביום שבו הושלמו *כל* מסלולי היום. עם חמישה מסלולים
+// מקבילים זה כמעט לא קרה: 11 ימי לימוד בפועל הניבו רצף 1. מעכשיו הרצף נשען על
+// יעד אישי קטן - יום שבו למדת משהו - ומחושב על לוח תאריכים אמיתי, עם הבחנה בין
+// רצף נוכחי לשיא. שבת ויום טוב אינם שוברים רצף. ההישג הישן ("השלמת כל התכנית")
+// נשמר בנפרד ולא נמחק.
+const STUDY_DAYS_MAX = 400;
+
+// השלמה למאגרים ישנים: ימי הלימוד נגזרים מהיסטוריה שכבר תועדה (learnedAt
+// ויומן החזרות) - לא ממציאים אירוע שלא היה.
+function ensureStudyDays(store) {
+  if (!store.stats) store.stats = { streak: 0, lastCompleted: null, totalLearned: 0 };
+  if (!Array.isArray(store.stats.studyDays)) {
+    const days = new Set();
+    for (const u of Object.values(store.units || {})) {
+      if (u.learnedAt) days.add(u.learnedAt);
+      for (const r of u.reviewLog || []) if (r.at) days.add(r.at);
+    }
+    if (store.stats.lastCompleted) days.add(store.stats.lastCompleted);
+    store.stats.studyDays = [...days].sort().slice(-STUDY_DAYS_MAX);
+    store.stats.studyDaysBackfilled = today();
+  }
+  return store.stats.studyDays;
+}
+
+export function markStudyDay(store, date = today()) {
+  const days = ensureStudyDays(store);
+  if (!days.includes(date)) {
+    store.stats.studyDays = [...days, date].sort().slice(-STUDY_DAYS_MAX);
+    logEvent('study_day', { user: internalId(store.id), date });
+  }
+}
+
+// פער בין שני ימי לימוד שאינו שובר רצף: יום אחד, או רק ימי מנוחה ביניהם
+function gapIsForgiven(a, b, store) {
+  const diff = daysBetween(a, b);
+  if (diff === null || diff <= 0) return false;
+  if (diff === 1) return true;
+  if (!store.user?.skipShabbat) return false;
+  for (let i = 1; i < diff; i++) {
+    if (!isRestDateStr(addDays(a, i))) return false;
+  }
+  return true;
+}
+
+export function streakInfo(store) {
+  const days = ensureStudyDays(store);
+  let longest = 0;
+  let run = 0;
+  for (let i = 0; i < days.length; i++) {
+    run = i && gapIsForgiven(days[i - 1], days[i], store) ? run + 1 : 1;
+    if (run > longest) longest = run;
+  }
+  let current = 0;
+  if (days.length) {
+    const last = days[days.length - 1];
+    if (last === today() || gapIsForgiven(last, today(), store)) {
+      current = 1;
+      for (let i = days.length - 1; i > 0; i--) {
+        if (gapIsForgiven(days[i - 1], days[i], store)) current++;
+        else break;
+      }
+    }
+  }
+  return { current, longest, total: days.length, last: days[days.length - 1] || null };
+}
+
+// ההישג הישן: יום שבו הושלמה כל התכנית. נשמר כפי שהיה, ולא משמש יותר כרצף.
 function touchStreak(store) {
   const t = today();
+  markStudyDay(store, t);
   if (store.stats.lastCompleted === t) return;
   const yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
   const y = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
   store.stats.streak = store.stats.lastCompleted === y ? store.stats.streak + 1 : 1;
   store.stats.lastCompleted = t;
+  store.stats.fullDays = (store.stats.fullDays || 0) + 1;
 }

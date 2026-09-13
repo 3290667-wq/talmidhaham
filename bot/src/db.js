@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, copyFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { DATA_DIR } from './config.js';
 import { buildTrack } from './curriculum.js';
@@ -32,6 +32,7 @@ function loadAll() {
   }
   if (!store.users) store.users = {};
   migrateKitzur(store);
+  migrateStudyDays(store);
   return store;
 }
 
@@ -54,6 +55,27 @@ function migrateKitzur(all) {
       changed = true;
       console.log(`[DB] מסלול ההלכה של ${u.name || u.id} הועבר מקיצור שו"ע ל${tr.bookHe}`);
     }
+  }
+  if (changed) writeStore();
+}
+
+// מיגרציה (KETER-UPGRADE-20260913): ימי הלימוד עוברים להיות רשימת תאריכים
+// אמיתית, כדי שהרצף יחושב על לוח שנה ולא ממונה יחיד. הרשימה נגזרת מהיסטוריה
+// שכבר תועדה (learnedAt ויומן החזרות) - לא ממציאים יום לימוד שלא נרשם.
+function migrateStudyDays(all) {
+  let changed = false;
+  for (const u of Object.values(all.users)) {
+    if (!u.stats) u.stats = { streak: 0, lastCompleted: null, totalLearned: 0 };
+    if (Array.isArray(u.stats.studyDays)) continue;
+    const days = new Set();
+    for (const unit of Object.values(u.units || {})) {
+      if (unit.learnedAt) days.add(unit.learnedAt);
+      for (const r of unit.reviewLog || []) if (r.at) days.add(r.at);
+    }
+    u.stats.studyDays = [...days].sort().slice(-400);
+    u.stats.studyDaysBackfilled = today();
+    changed = true;
+    console.log(`[DB] ${u.stats.studyDays.length} ימי לימוד הושלמו מההיסטוריה עבור ${u.name || u.id}`);
   }
   if (changed) writeStore();
 }
@@ -95,4 +117,44 @@ export function addDays(dateStr, days) {
   const d = new Date(dateStr + 'T12:00:00');
   d.setDate(d.getDate() + days);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// ============ גיבויים מחזוריים ============
+// השמירה עצמה כבר אטומית (קובץ זמני + rename) ואין לשנות אותה. מה שחסר היה
+// גיבוי: עד היום היו רק 8 עותקים ידניים. כאן נשמר עותק יומי, נבדק בקריאה
+// מיד אחרי הכתיבה (גיבוי שלא נקרא אינו גיבוי), ונשמרים KEEP_BACKUPS עותקים.
+const BACKUP_DIR = join(DATA_DIR, 'backups');
+const KEEP_BACKUPS = 14;
+
+export function backupStore(tag = 'auto') {
+  try {
+    if (!existsSync(STORE_PATH)) return { ok: false, reason: 'אין מאגר לגבות' };
+    if (!existsSync(BACKUP_DIR)) mkdirSync(BACKUP_DIR, { recursive: true });
+    const d = new Date();
+    const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}-${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}`;
+    const path = join(BACKUP_DIR, `store-${stamp}-${tag}.json`);
+    copyFileSync(STORE_PATH, path);
+    // אימות: הגיבוי נקרא ומכיל את מה שהוא אמור להכיל
+    const check = JSON.parse(readFileSync(path, 'utf8'));
+    const users = Object.keys(check.users || {}).length;
+    const units = Object.values(check.users || {}).reduce((n, u) => n + Object.keys(u.units || {}).length, 0);
+    if (!check.users) throw new Error('גיבוי בלי users');
+    const files = readdirSync(BACKUP_DIR).filter((f) => f.startsWith('store-')).sort();
+    while (files.length > KEEP_BACKUPS) unlinkSync(join(BACKUP_DIR, files.shift()));
+    return { ok: true, path, users, units };
+  } catch (e) {
+    return { ok: false, reason: e.message };
+  }
+}
+
+// האם כבר יש גיבוי מהיום (כדי לגבות פעם ביום ולא בכל טיק של המתזמן)
+export function hasBackupToday() {
+  try {
+    if (!existsSync(BACKUP_DIR)) return false;
+    const d = new Date();
+    const prefix = `store-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}-`;
+    return readdirSync(BACKUP_DIR).some((f) => f.startsWith(prefix));
+  } catch {
+    return false;
+  }
 }

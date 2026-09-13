@@ -4,8 +4,35 @@ import { config } from './config.js';
 
 const BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-// קריאה ל-Gemini. schema (לא חובה) אוכף מבנה JSON בתשובה.
-async function callGemini(system, userMsg, { maxTokens = 4000, schema = null, label = 'ai', temperature = null } = {}) {
+// שגיאה עם סיווג: transient = שווה לנסות שוב; ungraded = לא התקבל דירוג תקין.
+function aiError(message, kind) {
+  const e = new Error(message);
+  e.kind = kind;
+  return e;
+}
+export function isUngraded(err) { return err?.kind === 'ungraded'; }
+
+const RETRY_DELAYS_MS = [1500, 4000]; // עד שני ניסיונות חוזרים, רק לשגיאה זמנית
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// קריאה ל-Gemini עם ניסיון חוזר מוגבל לשגיאות זמניות בלבד (עומס/רשת/5xx).
+// כשל קבוע (מפתח, הרשאה, חסימה, קרדיטים) נכשל מיד - ניסיון חוזר רק מעכב.
+async function callGemini(system, userMsg, opts = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      return await callGeminiOnce(system, userMsg, opts);
+    } catch (e) {
+      lastErr = e;
+      if (e.kind !== 'transient' || attempt === RETRY_DELAYS_MS.length) throw e;
+      console.log(`[AI] ${opts.label || 'ai'}: ניסיון חוזר ${attempt + 1} אחרי "${e.message}"`);
+      await sleep(RETRY_DELAYS_MS[attempt]);
+    }
+  }
+  throw lastErr;
+}
+
+async function callGeminiOnce(system, userMsg, { maxTokens = 4000, schema = null, label = 'ai', temperature = null } = {}) {
   if (!config.geminiKey) {
     throw new Error('חסר מפתח GEMINI_API_KEY בקובץ .env - ראה README');
   }
@@ -36,7 +63,7 @@ async function callGemini(system, userMsg, { maxTokens = 4000, schema = null, la
       }),
     });
   } catch {
-    throw new Error('לא הצלחתי להתחבר ל-AI (בעיית רשת). נסה שוב.');
+    throw aiError('לא הצלחתי להתחבר ל-AI (בעיית רשת). נסה שוב.', 'transient');
   }
 
   if (!res.ok) {
@@ -47,7 +74,8 @@ async function callGemini(system, userMsg, { maxTokens = 4000, schema = null, la
     if (res.status === 429 && /depleted/i.test(body)) {
       throw new Error('נגמרו הקרדיטים של ה-AI בחשבון — צריך לטעון יתרה ב-AI Studio. עד אז הבחנים לא יעבדו.');
     }
-    if (res.status === 429) throw new Error('יש עומס רגעי על ה-AI. נסה שוב בעוד דקה.');
+    if (res.status === 429) throw aiError('יש עומס רגעי על ה-AI. נסה שוב בעוד דקה.', 'transient');
+    if (res.status >= 500) throw aiError(`ה-AI לא זמין כרגע (${res.status}). מנסה שוב.`, 'transient');
     throw new Error(`Gemini ${res.status}: ${body.slice(0, 300)}`);
   }
 
@@ -75,7 +103,7 @@ function parseJson(text) {
     // רשת ביטחון אם הפלט המובנה לא נאכף מסיבה כלשהי
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
-    if (start < 0 || end < 0) throw new Error('AI לא החזיר JSON תקין');
+    if (start < 0 || end < 0) throw aiError('AI לא החזיר JSON תקין', 'ungraded');
     return JSON.parse(text.slice(start, end + 1));
   }
 }
@@ -169,6 +197,15 @@ ${avoid.map((q) => `- ${q}`).join('\n')}`;
   return json.questions.slice(0, total);
 }
 
+// ולידציה של תשובת הדירוג. פונקציה טהורה כדי שתהיה ניתנת לבדיקה בלי רשת.
+export function validateGrade(json) {
+  const raw = Number(json?.score);
+  if (!Number.isFinite(raw)) throw aiError('הדירוג חזר בלי ציון תקין - התשובה לא דורגה.', 'ungraded');
+  const feedback = String(json?.feedback || '').trim();
+  if (!feedback) throw aiError('הדירוג חזר בלי משוב - התשובה לא דורגה.', 'ungraded');
+  return { score: Math.max(0, Math.min(100, Math.round(raw))), feedback };
+}
+
 // בדיקת תשובה של הלומד מול התשובה הנכונה והטקסט
 export async function gradeAnswer(refHe, sourceText, question, ideal, userAnswer) {
   const system = `אתה חברותא מעודד אך אמיתי שבודק תשובות חזרה. ${IRON_RULES}`;
@@ -183,7 +220,9 @@ ${sourceText}
 דרג את תשובת הלומד (0-100) ותן משוב קצר, ענייני ומעודד. אם התשובה חלקית - השלם את החסר.`;
   const out = await callGemini(system, user, { maxTokens: 4000, schema: GRADE_SCHEMA, label: 'grade' });
   const json = parseJson(out);
-  return { score: Math.max(0, Math.min(100, Number(json.score) || 0)), feedback: String(json.feedback || '') };
+  // אין ברירת מחדל לציון. 0 הוא ציון לגיטימי כשהוא הגיע מדירוג אמיתי, ולכן
+  // ערך חסר/לא מספרי אינו נהפך ל-0 אלא מסומן "לא דורג" - בלי ציון, בלי קידום.
+  return validateGrade(json);
 }
 
 // מענה על שאלה בסוגיה - מעוגן בטקסט בלבד
